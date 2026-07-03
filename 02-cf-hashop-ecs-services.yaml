@@ -1,0 +1,1207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  HaShop ECS services stack. Creates Fargate task definitions and ECS services
+  for API containers and workers. This version uses the clean PrimaryDbSecretArn
+  exported by 01-cf-hashop-foundation-v5-primary-rds-clean.yaml.
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Default: cf-hashop-foundation
+    Description: Name of the foundation stack created from 01-cf-hashop-foundation.yaml.
+  ProjectName:
+    Type: String
+    Default: cf-hashop
+    Description: Must match the ProjectName used by the foundation stack for log group names.
+  EnvironmentName:
+    Type: String
+    Default: test
+  DesiredApiCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+  DesiredWorkerCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+
+  UserServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/user-service:latest
+  ProductServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/product-service:latest
+  InventoryServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/inventory-service:latest
+  CartServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/cart-service:latest
+  OrderServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/order-service:latest
+  PaymentServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/payment-service:latest
+  NotificationServiceImageUri:
+    Type: String
+    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/notification-service:latest
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Foundation stack
+        Parameters:
+          - FoundationStackName
+          - ProjectName
+          - EnvironmentName
+      - Label:
+          default: Desired counts
+        Parameters:
+          - DesiredApiCount
+          - DesiredWorkerCount
+      - Label:
+          default: Container images
+        Parameters:
+          - UserServiceImageUri
+          - ProductServiceImageUri
+          - InventoryServiceImageUri
+          - CartServiceImageUri
+          - OrderServiceImageUri
+          - PaymentServiceImageUri
+          - NotificationServiceImageUri
+
+Resources:
+  # =========================================================
+  # Task Definitions - API services
+  # =========================================================
+  UserApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-user-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-UserTaskRoleArn'
+      ContainerDefinitions:
+        - Name: user-service
+          Image: !Ref UserServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+              Protocol: tcp
+              Name: user-http
+              AppProtocol: http
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: DB_NAME
+              Value: ecommerce_user_db
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PORT
+              Value: '3000'
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_CLIENT_SECRET
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_CLIENT_SECRET::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/user-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ProductApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-product-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-ProductTaskRoleArn'
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Ref ProductServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3001
+              HostPort: 3001
+              Protocol: tcp
+              Name: product-http
+              AppProtocol: http
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: CLOUDFRONT_DOMAIN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-ProductImagesCloudFrontDomainName'
+            - Name: PORT
+              Value: '3001'
+            - Name: INVENTORY_SERVICE_URL
+              Value: http://inventory-service:3002
+            - Name: DB_NAME
+              Value: ecommerce_product_db
+            - Name: NODE_ENV
+              Value: production
+            - Name: S3_BUCKET_NAME
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-ProductImagesBucketName'
+          Secrets:
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:INTERNAL_API_KEY::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-InternalApiKeySecretArn'
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/product-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  InventoryApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-inventory-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-InventoryTaskRoleArn'
+      ContainerDefinitions:
+        - Name: inventory-service
+          Image: !Ref InventoryServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3002
+              HostPort: 3002
+              Protocol: tcp
+              Name: inventory-http
+              AppProtocol: http
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_NAME
+              Value: ecommerce_inventory_db
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '3002'
+          Secrets:
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:INTERNAL_API_KEY::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-InternalApiKeySecretArn'
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/inventory-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  CartApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-cart-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-CartTaskRoleArn'
+      ContainerDefinitions:
+        - Name: cart-service
+          Image: !Ref CartServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3003
+              HostPort: 3003
+              Protocol: tcp
+              Name: cart-http
+              AppProtocol: http
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PORT
+              Value: '3003'
+            - Name: INVENTORY_SERVICE_URL
+              Value: http://inventory-service:3002
+            - Name: DB_NAME
+              Value: ecommerce_cart_db
+            - Name: NODE_ENV
+              Value: production
+            - Name: PRODUCT_SERVICE_URL
+              Value: http://product-service:3001
+          Secrets:
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:INTERNAL_API_KEY::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-InternalApiKeySecretArn'
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/cart-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  OrderApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-order-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-OrderApiTaskRoleArn'
+      ContainerDefinitions:
+        - Name: order-service
+          Image: !Ref OrderServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          Command:
+            - npm
+            - run
+            - start:api
+          PortMappings:
+            - ContainerPort: 3004
+              HostPort: 3004
+              Protocol: tcp
+              Name: order-http
+              AppProtocol: http
+          Environment:
+            - Name: PAYMENT_REQUESTED_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-PaymentRequestedTopicArn'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PAYMENT_SERVICE_URL
+              Value: http://payment-service:3005
+            - Name: PORT
+              Value: '3004'
+            - Name: USER_SERVICE_URL
+              Value: http://user-service:3000
+            - Name: CART_SERVICE_URL
+              Value: http://cart-service:3003
+            - Name: INVENTORY_SERVICE_URL
+              Value: http://inventory-service:3002
+            - Name: NOTIFICATION_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-NotificationTopicArn'
+            - Name: DB_NAME
+              Value: ecommerce_order_db
+            - Name: NODE_ENV
+              Value: production
+            - Name: PRODUCT_SERVICE_URL
+              Value: http://product-service:3001
+          Secrets:
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:INTERNAL_API_KEY::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-InternalApiKeySecretArn'
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/order-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  PaymentApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-payment-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-PaymentApiTaskRoleArn'
+      ContainerDefinitions:
+        - Name: payment-service
+          Image: !Ref PaymentServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          Command:
+            - npm
+            - run
+            - start:api
+          PortMappings:
+            - ContainerPort: 3005
+              HostPort: 3005
+              Protocol: tcp
+              Name: payment-http
+              AppProtocol: http
+          Environment:
+            - Name: PAYMENT_RESULT_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-PaymentResultTopicArn'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_NAME
+              Value: ecommerce_payment_db
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '3005'
+          Secrets:
+            - Name: COGNITO_APP_CLIENT_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_APP_CLIENT_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Sub
+                - '${SecretArn}:COGNITO_USER_POOL_ID::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-CognitoSecretArn'
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/payment-service'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # =========================================================
+  # Task Definitions - Workers
+  # =========================================================
+  PaymentWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-payment-worker'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-PaymentWorkerTaskRoleArn'
+      ContainerDefinitions:
+        - Name: payment-worker
+          Image: !Ref PaymentServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          Command:
+            - npm
+            - run
+            - start:worker
+          Environment:
+            - Name: PAYMENT_REQUESTED_QUEUE_URL
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-PaymentRequestedQueueUrl'
+            - Name: PAYMENT_RESULT_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-PaymentResultTopicArn'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_NAME
+              Value: ecommerce_payment_db
+            - Name: NODE_ENV
+              Value: production
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/payment-worker'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  OrderWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-order-worker'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-OrderWorkerTaskRoleArn'
+      ContainerDefinitions:
+        - Name: order-worker
+          Image: !Ref OrderServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          Command:
+            - npm
+            - run
+            - start:worker
+          Environment:
+            - Name: NOTIFICATION_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-NotificationTopicArn'
+            - Name: PAYMENT_RESULT_QUEUE_URL
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-PaymentResultQueueUrl'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_NAME
+              Value: ecommerce_order_db
+            - Name: NODE_ENV
+              Value: production
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub
+                - '${SecretArn}:host::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/order-worker'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  NotificationWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${EnvironmentName}-notification-worker'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-NotificationWorkerTaskRoleArn'
+      ContainerDefinitions:
+        - Name: notification-worker
+          Image: !Ref NotificationServiceImageUri
+          Cpu: 512
+          Memory: 1024
+          MemoryReservation: 512
+          Essential: true
+          Command:
+            - npm
+            - run
+            - start:worker
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: NOTIFICATION_REQUESTED_QUEUE_URL
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-NotificationQueueUrl'
+            - Name: SES_FROM_EMAIL
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-SesFromEmail'
+            - Name: ADMIN_EMAIL
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-AdminEmail'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ProjectName}/notification-worker'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # =========================================================
+  # ECS Services - API services with ALB + Service Connect
+  # =========================================================
+  UserApiService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: user-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref UserApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: user-service
+          ContainerPort: 3000
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-UserTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: user-http
+            DiscoveryName: user-service
+            ClientAliases:
+              - DnsName: user-service
+                Port: 3000
+
+  ProductApiService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - InventoryApiService
+    Properties:
+      ServiceName: product-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref ProductApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: product-service
+          ContainerPort: 3001
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-ProductTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: product-http
+            DiscoveryName: product-service
+            ClientAliases:
+              - DnsName: product-service
+                Port: 3001
+
+  InventoryApiService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: inventory-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref InventoryApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: inventory-service
+          ContainerPort: 3002
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-InventoryTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: inventory-http
+            DiscoveryName: inventory-service
+            ClientAliases:
+              - DnsName: inventory-service
+                Port: 3002
+
+  CartApiService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProductApiService
+      - InventoryApiService
+    Properties:
+      ServiceName: cart-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref CartApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: cart-service
+          ContainerPort: 3003
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-CartTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: cart-http
+            DiscoveryName: cart-service
+            ClientAliases:
+              - DnsName: cart-service
+                Port: 3003
+
+  OrderApiService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - UserApiService
+      - ProductApiService
+      - InventoryApiService
+      - CartApiService
+      - PaymentApiService
+    Properties:
+      ServiceName: order-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref OrderApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: order-service
+          ContainerPort: 3004
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-OrderTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: order-http
+            DiscoveryName: order-service
+            ClientAliases:
+              - DnsName: order-service
+                Port: 3004
+
+  PaymentApiService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: payment-api
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref PaymentApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredApiCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      LoadBalancers:
+        - ContainerName: payment-service
+          ContainerPort: 3005
+          TargetGroupArn:
+            Fn::ImportValue:
+              Fn::Sub: '${FoundationStackName}-PaymentTargetGroupArn'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
+        Services:
+          - PortName: payment-http
+            DiscoveryName: payment-service
+            ClientAliases:
+              - DnsName: payment-service
+                Port: 3005
+
+  # =========================================================
+  # ECS Services - Workers
+  # =========================================================
+  PaymentWorkerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - PaymentApiService
+    Properties:
+      ServiceName: payment-worker
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref PaymentWorkerTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredWorkerCount
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+
+  OrderWorkerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - OrderApiService
+    Properties:
+      ServiceName: order-worker
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref OrderWorkerTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredWorkerCount
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+
+  NotificationWorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: notification-worker
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: '${FoundationStackName}-EcsClusterName'
+      TaskDefinition: !Ref NotificationWorkerTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredWorkerCount
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-EcsServiceSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
+            - Fn::ImportValue:
+                Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+
+Outputs:
+  UserApiTaskDefinitionArn:
+    Value: !Ref UserApiTaskDefinition
+  ProductApiTaskDefinitionArn:
+    Value: !Ref ProductApiTaskDefinition
+  InventoryApiTaskDefinitionArn:
+    Value: !Ref InventoryApiTaskDefinition
+  CartApiTaskDefinitionArn:
+    Value: !Ref CartApiTaskDefinition
+  OrderApiTaskDefinitionArn:
+    Value: !Ref OrderApiTaskDefinition
+  PaymentApiTaskDefinitionArn:
+    Value: !Ref PaymentApiTaskDefinition
+  PaymentWorkerTaskDefinitionArn:
+    Value: !Ref PaymentWorkerTaskDefinition
+  OrderWorkerTaskDefinitionArn:
+    Value: !Ref OrderWorkerTaskDefinition
+  NotificationWorkerTaskDefinitionArn:
+    Value: !Ref NotificationWorkerTaskDefinition
+  UserApiServiceName:
+    Value: !GetAtt UserApiService.Name
+  ProductApiServiceName:
+    Value: !GetAtt ProductApiService.Name
+  InventoryApiServiceName:
+    Value: !GetAtt InventoryApiService.Name
+  CartApiServiceName:
+    Value: !GetAtt CartApiService.Name
+  OrderApiServiceName:
+    Value: !GetAtt OrderApiService.Name
+  PaymentApiServiceName:
+    Value: !GetAtt PaymentApiService.Name
+  PaymentWorkerServiceName:
+    Value: !GetAtt PaymentWorkerService.Name
+  OrderWorkerServiceName:
+    Value: !GetAtt OrderWorkerService.Name
+  NotificationWorkerServiceName:
+    Value: !GetAtt NotificationWorkerService.Name

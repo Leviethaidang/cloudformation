@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  HaShop global AWS WAFv2 stack for the frontend CloudFront distribution.
+  Deploy this template in us-east-1 because CloudFront Web ACLs use Scope CLOUDFRONT.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cf-hashop
+    Description: Short resource prefix. Use the same value as the foundation stack.
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: Environment name. Use the same value as the foundation stack.
+  RateLimitPerFiveMinutes:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: Maximum requests from one IP address in a rolling five-minute window before AWS WAF blocks that IP.
+
+Resources:
+  FrontendWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-frontend-waf'
+      Description: !Sub 'AWS WAF Web ACL for ${ProjectName}-${EnvironmentName} frontend CloudFront distribution'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-${EnvironmentName}-frontend-waf'
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              # Cho phép admin upload ảnh sản phẩm qua /api/* mà không bị rule size body chặn nhầm.
+              # Các rule còn lại của CommonRuleSet vẫn block như bình thường.
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-${EnvironmentName}-common-rules'
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-${EnvironmentName}-known-bad-inputs'
+
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-${EnvironmentName}-ip-reputation'
+
+        - Name: RateLimitPerIp
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerFiveMinutes
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-${EnvironmentName}-rate-limit'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-frontend-waf'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  FrontendWebAclArn:
+    Description: Copy this ARN into the FrontendWebAclArn parameter of 01-cf-hashop-foundation-with-waf.yaml.
+    Value: !GetAtt FrontendWebAcl.Arn
+
+  FrontendWebAclId:
+    Description: AWS WAF Web ACL ID.
+    Value: !GetAtt FrontendWebAcl.Id
+
+  FrontendWebAclName:
+    Description: AWS WAF Web ACL name.
+    Value: !Sub '${ProjectName}-${EnvironmentName}-frontend-waf'

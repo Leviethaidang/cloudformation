@@ -1,0 +1,1885 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  HaShop foundation stack: VPC, single primary RDS + read replica, Secrets,
+  Cognito + Lambda trigger, SNS/SQS, S3 + CloudFront, ECS cluster, IAM roles,
+  ALB, target groups and VPC endpoints.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cf-hashop
+    Description: Short resource prefix. Use cf-hashop to avoid collision with existing manual hashop-* resources.
+  EnvironmentName:
+    Type: String
+    Default: test
+  AzA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-southeast-1a
+  AzB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-southeast-1b
+  DbUsername:
+    Type: String
+    Default: admin
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Master password for the primary RDS MySQL instance.
+  InternalApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Shared internal API key used between backend services.
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket that contains cognito post-confirmation Lambda zip.
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key of Lambda zip, for example lambda/post-confirmation/function.zip.
+  AdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Admin email used by notification worker later.
+  SesFromEmail:
+    Type: String
+    Default: no-reply@example.com
+    Description: SES sender email used by notification worker later.
+  FrontendWebAclArn:
+    Type: String
+    Default: ''
+    Description: Optional AWS WAFv2 Web ACL ARN for the frontend CloudFront distribution. Create this Web ACL in us-east-1 with Scope CLOUDFRONT. Leave empty to deploy CloudFront without WAF.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project
+        Parameters:
+          - ProjectName
+          - EnvironmentName
+      - Label:
+          default: Database
+        Parameters:
+          - DbUsername
+          - DbPassword
+      - Label:
+          default: Application secrets
+        Parameters:
+          - InternalApiKey
+          - AdminEmail
+          - SesFromEmail
+      - Label:
+          default: Lambda package
+        Parameters:
+          - LambdaCodeS3Bucket
+          - LambdaCodeS3Key
+      - Label:
+          default: Optional security
+        Parameters:
+          - FrontendWebAclArn
+
+Conditions:
+  HasFrontendWebAclArn: !Not [!Equals [!Ref FrontendWebAclArn, '']]
+
+Resources:
+  # =========================================================
+  # Networking
+  # =========================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-public-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-public-b'
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-app-a'
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-app-b'
+
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-db-a'
+
+  PrivateDbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.22.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-db-b'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-natgw'
+
+  PrivateAppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-app-rt'
+
+  PrivateAppDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateAppSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateAppSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateDbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-db-rt'
+
+  PrivateDbSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetA
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  PrivateDbSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetB
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  # =========================================================
+  # Security groups
+  # =========================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-alb-sg'
+
+  EcsServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Fargate services security group
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-ecs-services-sg'
+
+  EcsFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3005
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  EcsSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cognito post-confirmation Lambda SG
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-cognito-lambda-sg'
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpc-endpoint-sg'
+
+  PrimaryDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Primary RDS security group for all HaShop databases
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-primary-db-sg'
+
+  PrimaryDBFromEcsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PrimaryDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+
+  PrimaryDBFromLambdaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PrimaryDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # =========================================================
+  # VPC Endpoints for private access to AWS managed services
+  # =========================================================
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref PrivateAppRouteTable
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-s3-gateway-endpoint'
+
+  SqsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-sqs-endpoint'
+
+  SnsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-sns-endpoint'
+
+  LogsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-logs-endpoint'
+
+  SecretsManagerInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-secretsmanager-endpoint'
+
+  EcrApiInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-ecr-api-endpoint'
+
+  EcrDkrInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-ecr-dkr-endpoint'
+
+  # =========================================================
+  # RDS
+  # =========================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: HaShop private DB subnet group
+      SubnetIds:
+        - !Ref PrivateDbSubnetA
+        - !Ref PrivateDbSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-db-subnet-group'
+
+  PrimaryDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}-primary-db'
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: !Ref DbUsername
+      MasterUserPassword: !Ref DbPassword
+      DBName: ecommerce_user_db
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref PrimaryDBSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: true
+      BackupRetentionPeriod: 1
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+
+  # =========================================================
+  # Secrets Manager
+  # =========================================================
+  PrimaryDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Primary RDS connection for all HaShop databases
+      SecretString: !Sub |
+        {
+          "host": "${PrimaryDB.Endpoint.Address}",
+          "port": "3306",
+          "username": "${DbUsername}",
+          "password": "${DbPassword}"
+        }
+
+  InternalApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Internal API key for service-to-service calls
+      SecretString: !Sub |
+        {
+          "INTERNAL_API_KEY": "${InternalApiKey}"
+        }
+
+  # =========================================================
+  # Cognito + post-confirmation Lambda
+  # =========================================================
+  PostConfirmationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-cognito-post-confirmation-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-primary-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref PrimaryDBSecret
+
+  PostConfirmationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-cognito-post-confirmation-db'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt PostConfirmationLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt PrimaryDB.Endpoint.Address
+          DB_PORT: '3306'
+          DB_USER: !Ref DbUsername
+          DB_PASSWORD: !Sub '{{resolve:secretsmanager:${PrimaryDBSecret}:SecretString:password}}'
+          DB_NAME: ecommerce_user_db
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateAppSubnetA
+          - !Ref PrivateAppSubnetB
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${EnvironmentName}-user-pool'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: phone_number
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmationLambda.Arn
+
+  UserPoolInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${EnvironmentName}-user-service-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admin
+      Precedence: 1
+      UserPoolId: !Ref UserPool
+
+  CustomerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Customer
+      Precedence: 10
+      UserPoolId: !Ref UserPool
+
+  CognitoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Cognito values for ECS task definitions
+      SecretString: !Sub
+        - |
+          {
+            "COGNITO_USER_POOL_ID": "${PoolId}",
+            "COGNITO_APP_CLIENT_ID": "${ClientId}",
+            "COGNITO_CLIENT_SECRET": "${ClientSecret}"
+          }
+        - PoolId: !Ref UserPool
+          ClientId: !Ref UserPoolClient
+          ClientSecret: !GetAtt UserPoolClient.ClientSecret
+
+  # =========================================================
+  # SNS/SQS async messaging
+  # =========================================================
+  PaymentRequestedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-payment-requested-topic'
+
+  PaymentResultTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-payment-result-topic'
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notification-topic'
+
+  PaymentRequestedDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-requested-dlq'
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+
+  PaymentResultDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-result-dlq'
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+
+  NotificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-notification-dlq'
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+
+  PaymentRequestedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-requested-queue'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentRequestedDLQ.Arn
+        maxReceiveCount: 5
+
+  PaymentResultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-result-queue'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentResultDLQ.Arn
+        maxReceiveCount: 5
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-notification-queue'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDLQ.Arn
+        maxReceiveCount: 5
+
+  PaymentRequestedQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PaymentRequestedQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentRequestedQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref PaymentRequestedTopic
+
+  PaymentResultQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PaymentResultQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentResultQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref PaymentResultTopic
+
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  PaymentRequestedSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentRequestedTopic
+      Protocol: sqs
+      Endpoint: !GetAtt PaymentRequestedQueue.Arn
+      RawMessageDelivery: true
+
+  PaymentResultSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentResultTopic
+      Protocol: sqs
+      Endpoint: !GetAtt PaymentResultQueue.Arn
+      RawMessageDelivery: true
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+      RawMessageDelivery: true
+
+  # =========================================================
+  # S3 + CloudFront
+  # =========================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProductImagesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+              - PUT
+              - POST
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-frontend-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ProductImagesOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-product-images-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-frontend-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite clean frontend routes to HTML files
+        Runtime: cloudfront-js-1.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+
+            // Không rewrite API
+            if (uri.startsWith('/api/')) {
+                return request;
+            }
+
+            // Không rewrite file tĩnh
+            if (
+                uri.startsWith('/assets/') ||
+                uri.startsWith('/favicon') ||
+                uri.includes('.')
+            ) {
+                return request;
+            }
+
+            var routes = {
+                '/': '/index.html',
+
+                '/login': '/login.html',
+                '/register': '/register.html',
+
+                '/profile': '/profile.html',
+                '/profile/edit': '/edit-profile.html',
+                '/edit-profile': '/edit-profile.html',
+
+                '/cart': '/cart.html',
+
+                '/confirm-order': '/confirm-order.html',
+                '/confirm-order/cart': '/confirm-order.html',
+                '/confirm-order/buy-now': '/confirm-order.html',
+
+                '/orders': '/orders.html',
+
+                '/admin/users': '/admin-users.html',
+                '/admin/products': '/admin-products.html',
+                '/admin/categories': '/admin-categories.html',
+                '/admin/orders': '/admin-orders.html'
+            };
+
+            if (routes[uri]) {
+                request.uri = routes[uri];
+                return request;
+            }
+
+            // Product detail: hỗ trợ cả /products/1 và /product/1
+            if (uri.startsWith('/products/') || uri.startsWith('/product/')) {
+                request.uri = '/product-detail.html';
+                return request;
+            }
+
+            // Order detail
+            if (uri.startsWith('/orders/')) {
+                request.uri = '/order-detail.html';
+                return request;
+            }
+
+            // Không fallback về index để tránh che lỗi route
+            return request;
+        }
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-alb'
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName}-${EnvironmentName} frontend distribution'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        WebACLId: !If
+          - HasFrontendWebAclArn
+          - !Ref FrontendWebAclArn
+          - !Ref AWS::NoValue
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: AlbApiOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt FrontendRewriteFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: AlbApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  ProductImagesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName}-${EnvironmentName} product images distribution'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ProductImagesS3Origin
+            DomainName: !GetAtt ProductImagesBucket.RegionalDomainName
+            OriginAccessControlId: !Ref ProductImagesOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: ProductImagesS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+  ProductImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProductImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ProductImagesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${ProductImagesDistribution}'
+
+  # =========================================================
+  # ECS, Cloud Map and CloudWatch log groups
+  # =========================================================
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${ProjectName}.local'
+      Vpc: !Ref VPC
+      Description: !Sub '${ProjectName} ECS Service Connect namespace'
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${EnvironmentName}-cluster'
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+
+  UserLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/user-service'
+      RetentionInDays: 7
+
+  ProductLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/product-service'
+      RetentionInDays: 7
+
+  InventoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/inventory-service'
+      RetentionInDays: 7
+
+  CartLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/cart-service'
+      RetentionInDays: 7
+
+  OrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/order-service'
+      RetentionInDays: 7
+
+  PaymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/payment-service'
+      RetentionInDays: 7
+
+  NotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/notification-service'
+      RetentionInDays: 7
+
+  PaymentWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/payment-worker'
+      RetentionInDays: 7
+
+  OrderWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/order-worker'
+      RetentionInDays: 7
+
+  NotificationWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/notification-worker'
+      RetentionInDays: 7
+
+  # =========================================================
+  # IAM roles for ECS
+  # =========================================================
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-hashop-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref PrimaryDBSecret
+                  - !Ref InternalApiKeySecret
+                  - !Ref CognitoSecret
+
+  UserTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-user-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cognito-user-service-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:SignUp
+                  - cognito-idp:ConfirmSignUp
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:RespondToAuthChallenge
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:AdminDisableUser
+                  - cognito-idp:AdminEnableUser
+                  - cognito-idp:ListUsers
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminAddUserToGroup
+                Resource: !GetAtt UserPool.Arn
+
+  ProductTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-product-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: product-images-s3-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ProductImagesBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt ProductImagesBucket.Arn
+
+  InventoryTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-inventory-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  CartTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-cart-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  PaymentApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-payment-api-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  OrderApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-order-api-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: order-api-publish-events
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref PaymentRequestedTopic
+                  - !Ref NotificationTopic
+
+  PaymentWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-payment-worker-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: payment-worker-sqs-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt PaymentRequestedQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PaymentResultTopic
+
+  OrderWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-order-worker-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: order-worker-sqs-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt PaymentResultQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  NotificationWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-notification-worker-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: notification-worker-sqs-ses
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt NotificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  # =========================================================
+  # ALB target groups and listener rules
+  # =========================================================
+  UserTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-user-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  ProductTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-product-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3001
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  InventoryTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-inventory-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3002
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  CartTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-cart-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3003
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  OrderTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-order-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3004
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  PaymentTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-payment-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3005
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  AlbHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: text/plain
+            MessageBody: Not Found
+
+  UserListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/users
+            - /api/users/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref UserTargetGroup
+
+  ProductListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/products
+            - /api/products/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductTargetGroup
+
+  ProductCategoriesListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 21
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/categories
+            - /api/categories/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductTargetGroup
+
+  ProductSizesListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 22
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/sizes
+            - /api/sizes/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductTargetGroup
+
+  ProductColorsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 23
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/colors
+            - /api/colors/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductTargetGroup
+
+  InventoryListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/inventory
+            - /api/inventory/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref InventoryTargetGroup
+
+  CartListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 40
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/cart
+            - /api/cart/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref CartTargetGroup
+
+  OrderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 50
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/orders
+            - /api/orders/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref OrderTargetGroup
+
+  PaymentListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpListener
+      Priority: 60
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/payments
+            - /api/payments/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PaymentTargetGroup
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  VpcEndpointSecurityGroupId:
+    Value: !Ref VpcEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcEndpointSecurityGroupId'
+  S3GatewayEndpointId:
+    Value: !Ref S3GatewayEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-S3GatewayEndpointId'
+  SqsInterfaceEndpointId:
+    Value: !Ref SqsInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SqsInterfaceEndpointId'
+  SnsInterfaceEndpointId:
+    Value: !Ref SnsInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SnsInterfaceEndpointId'
+  LogsInterfaceEndpointId:
+    Value: !Ref LogsInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsInterfaceEndpointId'
+  SecretsManagerInterfaceEndpointId:
+    Value: !Ref SecretsManagerInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretsManagerInterfaceEndpointId'
+  EcrApiInterfaceEndpointId:
+    Value: !Ref EcrApiInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EcrApiInterfaceEndpointId'
+  EcrDkrInterfaceEndpointId:
+    Value: !Ref EcrDkrInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EcrDkrInterfaceEndpointId'
+  PrivateAppSubnetA:
+    Value: !Ref PrivateAppSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnetA'
+  PrivateAppSubnetB:
+    Value: !Ref PrivateAppSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnetB'
+  EcsServiceSecurityGroupId:
+    Value: !Ref EcsServiceSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsServiceSecurityGroupId'
+  EcsClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsClusterName'
+  ServiceDiscoveryNamespaceArn:
+    Value: !GetAtt ServiceDiscoveryNamespace.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceDiscoveryNamespaceArn'
+  AlbDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-AlbDnsName'
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendBucketName'
+  ProductImagesBucketName:
+    Value: !Ref ProductImagesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductImagesBucketName'
+  FrontendCloudFrontDomainName:
+    Value: !GetAtt FrontendDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendCloudFrontDomainName'
+  FrontendCloudFrontDistributionId:
+    Value: !Ref FrontendDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendCloudFrontDistributionId'
+  ProductImagesCloudFrontDomainName:
+    Value: !GetAtt ProductImagesDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductImagesCloudFrontDomainName'
+  PrimaryDBEndpoint:
+    Value: !GetAtt PrimaryDB.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryDBEndpoint'
+  PrimaryDBSecretArn:
+    Value: !Ref PrimaryDBSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryDBSecretArn'
+  CognitoSecretArn:
+    Value: !Ref CognitoSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoSecretArn'
+  InternalApiKeySecretArn:
+    Value: !Ref InternalApiKeySecret
+    Export:
+      Name: !Sub '${AWS::StackName}-InternalApiKeySecretArn'
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolId'
+  CognitoAppClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoAppClientId'
+  PaymentRequestedTopicArn:
+    Value: !Ref PaymentRequestedTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentRequestedTopicArn'
+  PaymentResultTopicArn:
+    Value: !Ref PaymentResultTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentResultTopicArn'
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+  PaymentRequestedQueueUrl:
+    Value: !Ref PaymentRequestedQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentRequestedQueueUrl'
+  PaymentResultQueueUrl:
+    Value: !Ref PaymentResultQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentResultQueueUrl'
+  NotificationQueueUrl:
+    Value: !Ref NotificationQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationQueueUrl'
+  EcsTaskExecutionRoleArn:
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsTaskExecutionRoleArn'
+  UserTaskRoleArn:
+    Value: !GetAtt UserTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserTaskRoleArn'
+  ProductTaskRoleArn:
+    Value: !GetAtt ProductTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductTaskRoleArn'
+  InventoryTaskRoleArn:
+    Value: !GetAtt InventoryTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryTaskRoleArn'
+  CartTaskRoleArn:
+    Value: !GetAtt CartTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CartTaskRoleArn'
+  PaymentApiTaskRoleArn:
+    Value: !GetAtt PaymentApiTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentApiTaskRoleArn'
+  OrderApiTaskRoleArn:
+    Value: !GetAtt OrderApiTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderApiTaskRoleArn'
+  PaymentWorkerTaskRoleArn:
+    Value: !GetAtt PaymentWorkerTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentWorkerTaskRoleArn'
+  OrderWorkerTaskRoleArn:
+    Value: !GetAtt OrderWorkerTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderWorkerTaskRoleArn'
+  NotificationWorkerTaskRoleArn:
+    Value: !GetAtt NotificationWorkerTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationWorkerTaskRoleArn'
+  UserTargetGroupArn:
+    Value: !Ref UserTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-UserTargetGroupArn'
+  ProductTargetGroupArn:
+    Value: !Ref ProductTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductTargetGroupArn'
+  InventoryTargetGroupArn:
+    Value: !Ref InventoryTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryTargetGroupArn'
+  CartTargetGroupArn:
+    Value: !Ref CartTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CartTargetGroupArn'
+  OrderTargetGroupArn:
+    Value: !Ref OrderTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderTargetGroupArn'
+  PaymentTargetGroupArn:
+    Value: !Ref PaymentTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentTargetGroupArn'
+  AdminEmailOutput:
+    Value: !Ref AdminEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminEmail'
+  SesFromEmailOutput:
+    Value: !Ref SesFromEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-SesFromEmail'
