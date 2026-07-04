@@ -23,6 +23,23 @@ Parameters:
       - t3.small
     Description: Temporary EC2 instance type used only to initialize databases.
 
+  BootstrapAdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Bootstrap admin email for the lab environment.
+
+  BootstrapAdminPassword:
+    Type: String
+    NoEcho: true
+    Default: Letmein123!!!
+    MinLength: 8
+    Description: Bootstrap admin password. Default uses an uppercase letter to satisfy the Cognito password policy.
+
+  BootstrapAdminFullName:
+    Type: String
+    Default: HaShop Admin
+    Description: Full name for the bootstrap admin user.
+
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
@@ -57,6 +74,19 @@ Resources:
                 Action:
                   - cloudformation:SignalResource
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource:
+                  - Fn::Sub:
+                      - 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${ImportedUserPoolId}'
+                      - ImportedUserPoolId:
+                          Fn::ImportValue:
+                            Fn::Sub: '${FoundationStackName}-CognitoUserPoolId'
 
   DbInitInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -119,6 +149,10 @@ Resources:
 
               export AWS_REGION='${AWS::Region}'
               PRIMARY_DB_SECRET_ARN='${PrimaryDBSecretArn}'
+              COGNITO_USER_POOL_ID='${CognitoUserPoolId}'
+              ADMIN_EMAIL='${BootstrapAdminEmail}'
+              ADMIN_PASSWORD='${BootstrapAdminPassword}'
+              ADMIN_FULL_NAME='${BootstrapAdminFullName}'
 
               echo "[DB-INIT] Loading primary database secret from Secrets Manager..."
               PRIMARY_SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$PRIMARY_DB_SECRET_ARN" --region "$AWS_REGION" --query SecretString --output text)
@@ -147,6 +181,29 @@ Resources:
                   category_name VARCHAR(100) NOT NULL UNIQUE,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
               );
+
+              INSERT IGNORE INTO categories (category_name)
+              VALUES
+              ('Áo thun'),
+              ('Áo sơ mi'),
+              ('Áo khoác'),
+              ('Áo len'),
+              ('Áo polo'),
+              ('Quần jean'),
+              ('Quần tây'),
+              ('Quần short'),
+              ('Quần kaki'),
+              ('Quần jogger'),
+              ('Thắt lưng'),
+              ('Ví da'),
+              ('Mũ nón'),
+              ('Kính mát'),
+              ('Túi xách'),
+              ('Giày dép'),
+              ('Giày sneaker'),
+              ('Giày tây'),
+              ('Giày lười'),
+              ('Dép sandal');
 
               CREATE TABLE IF NOT EXISTS products (
                   product_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -471,10 +528,107 @@ Resources:
 
               echo "[DB-INIT] Running SQL initialization..."
               python3 /tmp/run_sql.py
+
+              echo "[DB-INIT] Bootstrapping Cognito admin user..."
+              if aws cognito-idp admin-get-user \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --username "$ADMIN_EMAIL" \
+                --region "$AWS_REGION" >/tmp/hashop-admin-user.json 2>/dev/null; then
+                echo "[DB-INIT] Admin user already exists in Cognito: $ADMIN_EMAIL"
+              else
+                aws cognito-idp admin-create-user \
+                  --user-pool-id "$COGNITO_USER_POOL_ID" \
+                  --username "$ADMIN_EMAIL" \
+                  --user-attributes Name=email,Value="$ADMIN_EMAIL" Name=email_verified,Value=true Name=name,Value="$ADMIN_FULL_NAME" \
+                  --message-action SUPPRESS \
+                  --region "$AWS_REGION" >/tmp/hashop-admin-create-user.json
+                echo "[DB-INIT] Admin user created in Cognito: $ADMIN_EMAIL"
+              fi
+
+              aws cognito-idp admin-update-user-attributes \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --username "$ADMIN_EMAIL" \
+                --user-attributes Name=email_verified,Value=true Name=name,Value="$ADMIN_FULL_NAME" \
+                --region "$AWS_REGION"
+
+              aws cognito-idp admin-set-user-password \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --username "$ADMIN_EMAIL" \
+                --password "$ADMIN_PASSWORD" \
+                --permanent \
+                --region "$AWS_REGION"
+
+              aws cognito-idp admin-add-user-to-group \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --username "$ADMIN_EMAIL" \
+                --group-name Admin \
+                --region "$AWS_REGION"
+
+              ADMIN_SUB=$(aws cognito-idp admin-get-user \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --username "$ADMIN_EMAIL" \
+                --region "$AWS_REGION" \
+                --query "UserAttributes[?Name=='sub'].Value | [0]" \
+                --output text)
+
+              if [ -z "$ADMIN_SUB" ] || [ "$ADMIN_SUB" = "None" ]; then
+                echo "[DB-INIT] Could not resolve Cognito sub for admin user."
+                exit 1
+              fi
+
+              export ADMIN_SUB
+              export ADMIN_EMAIL
+              export ADMIN_FULL_NAME
+
+              cat > /tmp/bootstrap_admin_db.py <<'PY'
+              import json
+              import os
+              import pymysql
+
+              secret = json.loads(os.environ["PRIMARY_SECRET_JSON"])
+
+              conn = pymysql.connect(
+                  host=secret["host"],
+                  port=int(secret.get("port", 3306)),
+                  user=secret["username"],
+                  password=secret["password"],
+                  autocommit=True,
+                  charset="utf8mb4",
+              )
+
+              try:
+                  with conn.cursor() as cursor:
+                      cursor.execute(
+                          """
+                          INSERT INTO ecommerce_user_db.users
+                              (user_id, full_name, email, phone_number, default_shipping_address, status)
+                          VALUES
+                              (%s, %s, %s, NULL, NULL, 'ACTIVE')
+                          ON DUPLICATE KEY UPDATE
+                              full_name = VALUES(full_name),
+                              email = VALUES(email),
+                              status = 'ACTIVE',
+                              updated_at = CURRENT_TIMESTAMP
+                          """,
+                          (
+                              os.environ["ADMIN_SUB"],
+                              os.environ["ADMIN_FULL_NAME"],
+                              os.environ["ADMIN_EMAIL"],
+                          ),
+                      )
+                  print("[DB-INIT] Admin user inserted/updated in ecommerce_user_db.users.")
+              finally:
+                  conn.close()
+              PY
+
+              python3 /tmp/bootstrap_admin_db.py
               echo "[DB-INIT] Done."
             - PrimaryDBSecretArn:
                 Fn::ImportValue:
                   Fn::Sub: '${FoundationStackName}-PrimaryDBSecretArn'
+              CognitoUserPoolId:
+                Fn::ImportValue:
+                  Fn::Sub: '${FoundationStackName}-CognitoUserPoolId'
 
 Outputs:
   DbInitInstanceId:
