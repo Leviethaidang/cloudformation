@@ -8,7 +8,7 @@ Parameters:
   ProjectName:
     Type: String
     Default: cf-hashop
-    Description: Short resource prefix. Use cf-hashop to avoid collision with existing manual hashop-* resources.
+    Description: Short resource prefix.
   EnvironmentName:
     Type: String
     Default: test
