@@ -27,25 +27,25 @@ Parameters:
 
   UserServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/user-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/user-service:latest
   ProductServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/product-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/product-service:latest
   InventoryServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/inventory-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/inventory-service:latest
   CartServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/cart-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/cart-service:latest
   OrderServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/order-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/order-service:latest
   PaymentServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/payment-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/payment-service:latest
   NotificationServiceImageUri:
     Type: String
-    Default: 538661800393.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/notification-service:latest
+    Default: <ACCOUNT_ID>.dkr.ecr.ap-southeast-1.amazonaws.com/hashop/notification-service:latest
 
 Metadata:
   AWS::CloudFormation::Interface:
