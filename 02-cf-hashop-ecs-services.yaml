@@ -478,7 +478,7 @@ Resources:
               Value: http://cart-service:3003
             - Name: INVENTORY_SERVICE_URL
               Value: http://inventory-service:3002
-            - Name: NOTIFICATION_TOPIC_ARN
+            - Name: NOTIFICATION_REQUESTED_TOPIC_ARN
               Value:
                 Fn::ImportValue:
                   Fn::Sub: '${FoundationStackName}-NotificationTopicArn'
@@ -721,7 +721,7 @@ Resources:
             - run
             - start:worker
           Environment:
-            - Name: NOTIFICATION_TOPIC_ARN
+            - Name: NOTIFICATION_REQUESTED_TOPIC_ARN
               Value:
                 Fn::ImportValue:
                   Fn::Sub: '${FoundationStackName}-NotificationTopicArn'
@@ -731,11 +731,19 @@ Resources:
                   Fn::Sub: '${FoundationStackName}-PaymentResultQueueUrl'
             - Name: AWS_REGION
               Value: !Ref AWS::Region
+            - Name: CART_SERVICE_URL
+              Value: http://cart-service:3003
             - Name: DB_NAME
               Value: ecommerce_order_db
             - Name: NODE_ENV
               Value: production
           Secrets:
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:INTERNAL_API_KEY::'
+                - SecretArn:
+                    Fn::ImportValue:
+                      Fn::Sub: '${FoundationStackName}-InternalApiKeySecretArn'
             - Name: DB_HOST
               ValueFrom: !Sub
                 - '${SecretArn}:host::'
@@ -1120,6 +1128,7 @@ Resources:
     Type: AWS::ECS::Service
     DependsOn:
       - OrderApiService
+      - CartApiService
     Properties:
       ServiceName: order-worker
       Cluster:
@@ -1142,6 +1151,11 @@ Resources:
                 Fn::Sub: '${FoundationStackName}-PrivateAppSubnetA'
             - Fn::ImportValue:
                 Fn::Sub: '${FoundationStackName}-PrivateAppSubnetB'
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace:
+          Fn::ImportValue:
+            Fn::Sub: '${FoundationStackName}-ServiceDiscoveryNamespaceArn'
 
   NotificationWorkerService:
     Type: AWS::ECS::Service
